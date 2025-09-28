@@ -1,0 +1,140 @@
+/* ---------------- Base & shared layout ---------------- */
+:root {
+  /* Keep search and bottom bar widths perfectly in sync */
+  --ui-max-width: 380px;
+  --ui-side-padding: 14px;
+  --ui-radius: 14px;
+}
+
+html, body, #root { height: 100%; margin: 0; }
+html { -webkit-text-size-adjust: 100%; }
+.app { height: 100%; background: #f5efe6; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue"; }
+
+/* ---------------- Top search (safe-area aware) ---------------- */
+.home-search-wrap {
+  position: fixed;
+  top: calc(10px + env(safe-area-inset-top, 0px));
+  left: 0; right: 0;
+  z-index: 25;
+  display: flex; justify-content: center;
+  pointer-events: none; /* container ignores taps */
+}
+.home-search-inner {
+  width: min(var(--ui-max-width), 92vw);
+  position: relative;
+  pointer-events: auto; /* inner handles events */
+}
+.home-search-input {
+  width: 100%;
+  font-size: 16px; /* prevents iOS zoom-on-focus */
+  padding: 12px var(--ui-side-padding);
+  border-radius: var(--ui-radius);
+  border: 1px solid #e9ecef;
+  outline: none;
+  background: rgba(255,255,255,0.95);
+  box-shadow: 0 8px 28px rgba(0,0,0,.12);
+}
+.home-search-results {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0; right: 0;
+  background: #fff;
+  border: 1px solid #e9ecef;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0,0,0,.18);
+}
+.home-search-result {
+  display: block; width: 100%; text-align: left;
+  padding: 10px 12px; background: #fff; border: 0; cursor: pointer;
+}
+.home-search-result:hover { background: #f8f9fa; }
+.home-search-result .flag { font-size: 18px; margin-right: 8px; vertical-align: -2px; }
+
+/* ---------------- Bottom-left Countries bar (matches search) ---------------- */
+.countries-bar {
+  position: fixed;
+  left: 12px;
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  z-index: 26;
+
+  width: min(var(--ui-max-width), 92vw);
+  padding: 12px var(--ui-side-padding);
+  border-radius: var(--ui-radius);
+  border: 1px solid #e9ecef;
+  background: rgba(255,255,255,0.98);
+  box-shadow: 0 8px 28px rgba(0,0,0,.12);
+
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+
+  font-size: 15px;
+}
+.countries-bar .dot { opacity: 0.6; }
+.countries-bar .count { opacity: 0.8; font-variant-numeric: tabular-nums; }
+
+/* ---------------- Overlay ---------------- */
+.overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.25);
+  display: grid; place-items: center;
+  z-index: 50;
+}
+.overlay-inner {
+  width: min(960px, 92vw);
+  max-height: 86vh; overflow: hidden;
+  background: #fff; border-radius: 18px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.35);
+  color: #111;
+  display: grid; grid-template-rows: auto 1fr;
+}
+.overlay-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px; border-bottom: 1px solid #eee;
+}
+.close-btn {
+  background: #e9ecef; border: 0; padding: 8px 10px; border-radius: 8px; cursor: pointer;
+}
+
+/* Overlay search row/content */
+.search-row { padding: 16px; padding-bottom: 0; }
+.search-input {
+  width: 100%; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid #e9ecef; outline: none;
+}
+.section-title { font-weight: 700; margin: 12px 16px; color: #0b7285; }
+
+/* ---------------- Lists ---------------- */
+.country-list { list-style: none; margin: 0; padding: 0 16px 16px; }
+.country-list li { padding: 10px 6px; border-bottom: 1px solid #eee; background: #fff; }
+.country-row { display: grid; grid-template-columns: 36px 1fr; gap: 10px; align-items: start; }
+.flag { font-size: 20px; line-height: 36px; }
+.meta { display: grid; gap: 4px; }
+.country-name { font-weight: 600; font-size: 15px; color: #374151; } /* subtler */
+.years { display: grid; gap: 6px; margin-top: 2px; }
+.year-block { display: grid; grid-template-columns: 60px 1fr; align-items: start; gap: 8px; }
+.year {
+  font-weight: 700; color: #0b7285; background: #e7f5ff;
+  padding: 2px 8px; border-radius: 999px; width: max-content; font-size: 12px;
+}
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  background: #f1f3f5; color: #475569; font-size: 12px; border: 1px solid #e9ecef;
+}
+.not-logged { display: flex; align-items: center; gap: 8px; color: #666; margin-top: 4px; font-size: 13px; }
+.add-btn {
+  padding: 4px 8px; border-radius: 8px; border: 1px solid #0b7285;
+  background: #fff; color: #0b7285; cursor: pointer;
+}
+
+.overlay-actions { margin: 8px 16px 16px; display: flex; justify-content: flex-end; gap: 8px; }
+button.danger { background: #ffebee; color: #b71c1c; border: 1px solid #e57373; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+
+/* ---------------- Cleanup ---------------- */
+.countries-btn { display: none !important; }

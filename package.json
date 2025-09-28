@@ -1,0 +1,30 @@
+{
+  "name": "globe-reservations",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "d3-geo": "^3.1.1",
+    "i18n-iso-countries": "^7.14.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-globe.gl": "^2.36.0",
+    "three": "^0.180.0",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2",
+    "world-countries": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@types/three": "^0.180.0",
+    "@vitejs/plugin-react": "^5.0.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}
