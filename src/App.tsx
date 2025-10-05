@@ -9,6 +9,7 @@
 // ---------------------------------------------------------------
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, JSX } from "react";
 import Globe from "react-globe.gl";
 import * as topojson from "topojson-client";
 import * as THREE from "three";
@@ -28,7 +29,28 @@ type VisitsMap = Record<string, { alpha2?: string; name?: string; dates: string[
 
 type Anchor = { id: string | number; name: string; lat: number; lng: number; area: number };
 
-type Plan = { id: string | number; alpha2?: string; name: string; dateISO: string; endISO?: string };
+type Plan = {
+  id: string | number;
+  alpha2?: string;
+  name: string;
+  startISO: string;
+  endISO?: string;
+  /** @deprecated kept for older localStorage payloads */
+  dateISO?: string;
+};
+
+type TripActivityCategory = "experience" | "meal" | "travel" | "free" | string;
+
+type TripActivity = {
+  id: string;
+  title: string;
+  startISO: string;
+  endISO: string;
+  category?: TripActivityCategory;
+  notes?: string;
+};
+
+type TripSchedules = Record<string, Record<string, TripActivity[]>>;
 
 type Screen = "map" | "trips" | "reservations" | "settings";
 
@@ -56,6 +78,7 @@ const LS_VISITS = "visited-country-ids";
 const LS_VISITS_META = "visit-dates-by-country";
 const LS_PLANS = "planned-trips";
 const LS_RESERVATIONS = "reservations";
+const LS_TRIP_SCHEDULES = "trip-schedules";
 
 /* ---------- Zoom/label behaviour ---------- */
 const ALT_MIN = 0.7;
@@ -147,11 +170,73 @@ function angDist(a: { lat: number; lng: number }, b: { lat: number; lng: number 
   return deg;
 }
 
-function daysUntil(dateISO: string) {
-  const today = new Date();
-  const target = new Date(dateISO);
-  const ms = target.setHours(0, 0, 0, 0) - today.setHours(0, 0, 0, 0);
-  return Math.ceil(ms / (1000 * 60 * 60 * 24));
+const MINUTES_IN_DAY = 24 * 60;
+
+function normalizeHHMM(value: string, fallback = "09:00") {
+  if (!value) return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  if (/^\d{1,2}$/.test(trimmed)) {
+    return `${trimmed.padStart(2, "0")}:00`;
+  }
+  if (/^\d{1,2}:\d{1,2}$/.test(trimmed)) {
+    const [hStr, mStr] = trimmed.split(":");
+    const h = Math.max(0, Math.min(23, parseInt(hStr, 10) || 0));
+    const m = Math.max(0, Math.min(59, parseInt(mStr, 10) || 0));
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  }
+  return fallback;
+}
+
+function timeToMinutes(value: string) {
+  const [hStr = "0", mStr = "0"] = value.split(":");
+  const h = parseInt(hStr, 10);
+  const m = parseInt(mStr, 10);
+  if (Number.isNaN(h) || Number.isNaN(m)) return 0;
+  return Math.max(0, Math.min(MINUTES_IN_DAY, h * 60 + m));
+}
+
+function minutesToHHMM(min: number) {
+  const clamped = Math.max(0, Math.min(min, MINUTES_IN_DAY - 1));
+  const h = Math.floor(clamped / 60);
+  const m = clamped % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function ensureEndAfterStart(start: string, end: string) {
+  const startMin = timeToMinutes(start);
+  let endMin = timeToMinutes(end);
+  if (endMin <= startMin) {
+    endMin = Math.min(MINUTES_IN_DAY - 1, startMin + 60);
+  }
+  return { start, end: minutesToHHMM(endMin) };
+}
+
+function clipRangeToDay(
+  dateISO: string,
+  startISO: string,
+  endISO?: string
+): { startMin: number; endMin: number } | null {
+  const dayStart = new Date(`${dateISO}T00:00:00`);
+  const dayEnd = new Date(`${dateISO}T23:59:59`);
+  const start = new Date(startISO);
+  const end = endISO ? new Date(endISO) : new Date(start.getTime() + 60 * 60000);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  const startMs = Math.max(dayStart.getTime(), start.getTime());
+  const endMs = Math.min(dayEnd.getTime(), Math.max(startMs + 30 * 60000, end.getTime()));
+  if (endMs < dayStart.getTime() || startMs > dayEnd.getTime()) return null;
+  const startMin = Math.max(
+    0,
+    Math.floor((startMs - dayStart.getTime()) / 60000)
+  );
+  const endMin = Math.max(
+    startMin + 30,
+    Math.ceil((endMs - dayStart.getTime()) / 60000)
+  );
+  return {
+    startMin,
+    endMin: Math.min(MINUTES_IN_DAY, endMin),
+  };
 }
 
 /* ---------- Continent anchors ---------- */
@@ -332,9 +417,33 @@ function AppInner() {
   const [plans, setPlans] = useState<Plan[]>(() => {
     if (typeof window === "undefined") return [];
     try {
-      return JSON.parse(window.localStorage.getItem(LS_PLANS) || "[]");
+      const raw = JSON.parse(window.localStorage.getItem(LS_PLANS) || "[]");
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .map((p: any) => {
+          const startISO = p?.startISO || p?.dateISO || p?.date || "";
+          const endISO = p?.endISO || p?.finishISO || undefined;
+          return {
+            ...p,
+            startISO,
+            endISO,
+          } as Plan;
+        })
+        .filter((p) => Boolean(p.startISO));
     } catch {
       return [];
+    }
+  });
+
+  const [tripSchedules, setTripSchedules] = useState<TripSchedules>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = JSON.parse(
+        window.localStorage.getItem(LS_TRIP_SCHEDULES) || "{}"
+      );
+      return raw && typeof raw === "object" ? raw : {};
+    } catch {
+      return {};
     }
   });
 
@@ -367,6 +476,14 @@ function AppInner() {
       window.localStorage.setItem(LS_RESERVATIONS, JSON.stringify(reservations));
   }, [reservations]);
 
+  useEffect(() => {
+    if (typeof window !== "undefined")
+      window.localStorage.setItem(
+        LS_TRIP_SCHEDULES,
+        JSON.stringify(tripSchedules)
+      );
+  }, [tripSchedules]);
+
   const visitedCount = useMemo(() => Object.keys(visits).length, [visits]);
 
   const visitedList = useMemo(() => {
@@ -380,8 +497,6 @@ function AppInner() {
   }, [visits]);
 
   const totalCountries = countries.length;
-  const pctVisited = totalCountries ? (visitedCount / totalCountries) * 100 : 0;
-
   /* Global map state (Settings) */
   const [showCountryNameLabels, setShowCountryNameLabels] = useState(true);
   const [showContinentNameLabels, setShowContinentNameLabels] = useState(true);
@@ -424,28 +539,161 @@ function AppInner() {
     return v ? v.dates.length : 0;
   }
 
-  function addPlanFromPick(countryId: string | number, dateISO: string, endISO?: string) {
+  function addPlanFromPick(
+    countryId: string | number,
+    startISO: string,
+    endISO?: string
+  ) {
     const info = idInfo.get(countryId) || {};
     const name = info.name || "Unknown";
     const alpha2 = info.alpha2;
-    if (!dateISO) return;
+    if (!startISO) return;
     setPlans((prev) => {
       const exists = prev.find(
-        (p) => String(p.id) === String(countryId) && p.dateISO === dateISO
+        (p) => String(p.id) === String(countryId) && p.startISO === startISO
       );
       if (exists) return prev;
       return [
         ...prev,
-        { id: countryId, alpha2, name, dateISO, endISO },
+        { id: countryId, alpha2, name, startISO, endISO },
       ].sort(
         (a, b) =>
-          new Date(a.dateISO).getTime() - new Date(b.dateISO).getTime()
+          new Date(a.startISO).getTime() - new Date(b.startISO).getTime()
       );
     });
   }
 
   function removePlan(idx: number) {
-    setPlans((prev) => prev.filter((_, i) => i !== idx));
+    setPlans((prev) => {
+      const plan = prev[idx];
+      if (plan) {
+        setTripSchedules((prevSchedules) => {
+          const key = String(plan.id);
+          if (!(key in prevSchedules)) return prevSchedules;
+          const next = { ...prevSchedules };
+          delete next[key];
+          return next;
+        });
+      }
+      return prev.filter((_, i) => i !== idx);
+    });
+  }
+
+  function sortActivities(items: TripActivity[]) {
+    return items.slice().sort((a, b) => a.startISO.localeCompare(b.startISO));
+  }
+
+  function addTripActivity(
+    planId: string | number,
+    dateISO: string,
+    input: { title: string; start: string; end: string; category?: string; notes?: string }
+  ) {
+    const title = input.title?.trim();
+    if (!title || !input.start || !input.end) return;
+    const planKey = String(planId);
+    const normalizedStart = normalizeHHMM(input.start);
+    const normalizedEnd = normalizeHHMM(input.end, normalizedStart);
+    const { end } = ensureEndAfterStart(normalizedStart, normalizedEnd);
+    const startISO = `${dateISO}T${normalizedStart}:00`;
+    const endISO = `${dateISO}T${end}:00`;
+    const item: TripActivity = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      startISO,
+      endISO,
+      category: input.category || undefined,
+      notes: input.notes || undefined,
+    };
+    setTripSchedules((prev) => {
+      const dayMap = { ...(prev[planKey] || {}) };
+      const dayItems = sortActivities([...(dayMap[dateISO] || []), item]);
+      return {
+        ...prev,
+        [planKey]: {
+          ...dayMap,
+          [dateISO]: dayItems,
+        },
+      };
+    });
+  }
+
+  function updateTripActivity(
+    planId: string | number,
+    dateISO: string,
+    activityId: string,
+    updates: { title?: string; start?: string; end?: string; category?: string; notes?: string }
+  ) {
+    const planKey = String(planId);
+    setTripSchedules((prev) => {
+      const dayMap = { ...(prev[planKey] || {}) };
+      const items = (dayMap[dateISO] || []).slice();
+      const idx = items.findIndex((it) => it.id === activityId);
+      if (idx === -1) return prev;
+      const existing = items[idx];
+      const existingStartHHMM = existing.startISO.slice(11, 16) || "09:00";
+      const existingEndHHMM = existing.endISO
+        ? existing.endISO.slice(11, 16)
+        : minutesToHHMM(timeToMinutes(existingStartHHMM) + 60);
+      const nextStartHHMM = updates.start
+        ? normalizeHHMM(updates.start, existingStartHHMM)
+        : existingStartHHMM;
+      const nextEndHHMM = updates.end
+        ? normalizeHHMM(updates.end, existingEndHHMM)
+        : existingEndHHMM;
+      const ensured = ensureEndAfterStart(nextStartHHMM, nextEndHHMM);
+      const nextStart = `${dateISO}T${nextStartHHMM}:00`;
+      const nextEnd = `${dateISO}T${ensured.end}:00`;
+      const nextTitle =
+        "title" in updates
+          ? updates.title?.trim() || existing.title
+          : existing.title;
+      const nextCategory =
+        "category" in updates
+          ? updates.category || undefined
+          : existing.category;
+      const nextNotes =
+        "notes" in updates
+          ? updates.notes?.trim() || undefined
+          : existing.notes;
+      items[idx] = {
+        ...existing,
+        title: nextTitle,
+        category: nextCategory,
+        notes: nextNotes,
+        startISO: nextStart,
+        endISO: nextEnd,
+      };
+      dayMap[dateISO] = sortActivities(items);
+      return {
+        ...prev,
+        [planKey]: dayMap,
+      };
+    });
+  }
+
+  function removeTripActivity(
+    planId: string | number,
+    dateISO: string,
+    activityId: string
+  ) {
+    const planKey = String(planId);
+    setTripSchedules((prev) => {
+      const dayMap = { ...(prev[planKey] || {}) };
+      const items = (dayMap[dateISO] || []).filter((it) => it.id !== activityId);
+      if (!items.length) {
+        if (!dayMap[dateISO]) return prev;
+        delete dayMap[dateISO];
+      } else {
+        dayMap[dateISO] = items;
+      }
+      const next = { ...prev };
+      if (Object.keys(dayMap).length === 0) {
+        delete next[planKey];
+      } else {
+        next[planKey] = dayMap;
+      }
+      return next;
+    });
   }
 
   return (
@@ -460,7 +708,6 @@ function AppInner() {
           visitedList={visitedList}
           visitedCount={visitedCount}
           totalCountries={totalCountries}
-          pctVisited={pctVisited}
           onAddVisit={addVisitById}
           getVisitCount={visitCountFor}
           mapStyle={mapStyle}
@@ -474,8 +721,12 @@ function AppInner() {
           plans={plans}
           allCountries={allCountries}
           reservations={reservations}
-          onAdd={(id, dateISO, endISO) => addPlanFromPick(id, dateISO, endISO)}
+          schedules={tripSchedules}
+          onAdd={(id, startISO, endISO) => addPlanFromPick(id, startISO, endISO)}
           onRemove={removePlan}
+          onAddActivity={addTripActivity}
+          onUpdateActivity={updateTripActivity}
+          onRemoveActivity={removeTripActivity}
         />
       )}
       {screen === "reservations" && (
@@ -514,7 +765,6 @@ function MapScreen(props: {
   visitedList: { id: string | number; name: string; alpha2?: string; dates: string[] }[];
   visitedCount: number;
   totalCountries: number;
-  pctVisited: number;
   onAddVisit: (id: string | number) => void;
   getVisitCount: (id: string | number) => number;
   mapStyle: MapStyle;
@@ -531,7 +781,6 @@ function MapScreen(props: {
     visitedList,
     visitedCount,
     totalCountries,
-    pctVisited,
     onAddVisit,
     getVisitCount,
     mapStyle,
@@ -660,8 +909,11 @@ function MapScreen(props: {
     }
     if (showCountriesOverlay && typeof window !== "undefined")
       window.addEventListener("keydown", onEsc);
-    return () =>
-      typeof window !== "undefined" && window.removeEventListener("keydown", onEsc);
+    return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("keydown", onEsc);
+      }
+    };
   }, [showCountriesOverlay]);
 
   useEffect(() => {
@@ -1039,10 +1291,37 @@ function TripsScreen(props: {
   plans: Plan[];
   allCountries: { id: string | number; alpha2?: string; name: string; flag: string }[];
   reservations: Reservation[];
-  onAdd: (id: string | number, dateISO: string, endISO?: string) => void;
+  schedules: TripSchedules;
+  onAdd: (id: string | number, startISO: string, endISO?: string) => void;
   onRemove: (index: number) => void;
+  onAddActivity: (
+    planId: string | number,
+    dateISO: string,
+    input: { title: string; start: string; end: string; category?: string; notes?: string }
+  ) => void;
+  onUpdateActivity: (
+    planId: string | number,
+    dateISO: string,
+    activityId: string,
+    updates: { title?: string; start?: string; end?: string; category?: string; notes?: string }
+  ) => void;
+  onRemoveActivity: (
+    planId: string | number,
+    dateISO: string,
+    activityId: string
+  ) => void;
 }): JSX.Element {
-  const { plans, allCountries, reservations, onAdd, onRemove } = props;
+  const {
+    plans,
+    allCountries,
+    reservations,
+    schedules,
+    onAdd,
+    onRemove,
+    onAddActivity,
+    onUpdateActivity,
+    onRemoveActivity,
+  } = props;
   const [planQuery, setPlanQuery] = useState("");
   const [selectedCountry, setSelectedCountry] = useState<{ id: string | number; alpha2?: string; name: string; flag: string } | null>(null);
   const [showDatePicker, setShowDatePicker] = useState(false);
@@ -1050,6 +1329,33 @@ function TripsScreen(props: {
 
   // Cover images saved locally per plan id (so we don't need parent mutator)
   const [coverMap, setCoverMap] = useState<Record<string, string>>({});
+
+  const openTripSchedule = useMemo(() => {
+    if (!openTrip) return {} as Record<string, TripActivity[]>;
+    return schedules[String((openTrip as any).id)] || {};
+  }, [openTrip, schedules]);
+
+  const openTripReservations = useMemo(() => {
+    if (!openTrip) return [] as Reservation[];
+    const planId = String((openTrip as any).id);
+    const start = new Date(openTrip.startISO + "T00:00:00");
+    const end = new Date(
+      ((openTrip as any).endISO || openTrip.startISO) + "T23:59:59"
+    );
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    return reservations
+      .filter((r) => {
+        if (String((r as any).planId || "") === planId) return true;
+        const resStart = new Date(r.startISO).getTime();
+        const resEnd = r.endISO
+          ? new Date(r.endISO).getTime()
+          : resStart;
+        if (!Number.isFinite(resStart)) return false;
+        return resStart <= endMs && resEnd >= startMs;
+      })
+      .sort((a, b) => a.startISO.localeCompare(b.startISO));
+  }, [reservations, openTrip]);
 
   const suggestions = useMemo(() => {
     const q = planQuery.trim().toLowerCase();
@@ -1175,7 +1481,17 @@ function TripsScreen(props: {
     {openTrip && (
       <TripDetailsOverlay
         plan={openTrip}
-        reservations={reservations.filter(r => String((r as any).planId) === String((openTrip as any).id))}
+        reservations={openTripReservations}
+        activitiesByDay={openTripSchedule}
+        onAddActivity={(dateISO, payload) =>
+          onAddActivity((openTrip as any).id, dateISO, payload)
+        }
+        onUpdateActivity={(dateISO, activityId, updates) =>
+          onUpdateActivity((openTrip as any).id, dateISO, activityId, updates)
+        }
+        onRemoveActivity={(dateISO, activityId) =>
+          onRemoveActivity((openTrip as any).id, dateISO, activityId)
+        }
         coverUrl={coverFor((openTrip as any).id, (openTrip as any).coverUrl)}
         onChangeCover={(dataUrl) => setCoverMap(prev => ({ ...prev, [String((openTrip as any).id)]: dataUrl }))}
         onClose={() => setOpenTrip(null)}
@@ -1218,31 +1534,40 @@ function TripDatePicker({ country, onConfirm, onClose }: {
 function TripDetailsOverlay({
   plan,
   reservations,
+  activitiesByDay,
+  onAddActivity,
+  onUpdateActivity,
+  onRemoveActivity,
   coverUrl,
   onChangeCover,
   onClose,
 }: {
   plan: Plan;
   reservations: Reservation[];
+  activitiesByDay: Record<string, TripActivity[]>;
+  onAddActivity: (
+    dateISO: string,
+    input: { title: string; start: string; end: string; category?: string; notes?: string }
+  ) => void;
+  onUpdateActivity: (
+    dateISO: string,
+    activityId: string,
+    updates: { title?: string; start?: string; end?: string; category?: string; notes?: string }
+  ) => void;
+  onRemoveActivity: (dateISO: string, activityId: string) => void;
   coverUrl?: string;
   onChangeCover?: (dataUrl: string) => void;
   onClose: () => void;
 }): JSX.Element {
-  const byDay = useMemo(() => {
-    const map: Record<string, Reservation[]> = {};
-    reservations.forEach(r => {
-      const d = (r.startISO || "").slice(0,10);
-      if (!d) return;
-      (map[d] ||= []).push(r);
-    });
+  const dayList = useMemo(() => {
     const days: string[] = [];
     const start = new Date(plan.startISO + "T00:00:00");
     const end = new Date(((plan as any).endISO || plan.startISO) + "T00:00:00");
-    for (let t = start.getTime(); t <= end.getTime(); t += 24*3600*1000) {
-      days.push(new Date(t).toISOString().slice(0,10));
+    for (let t = start.getTime(); t <= end.getTime(); t += 24 * 3600 * 1000) {
+      days.push(new Date(t).toISOString().slice(0, 10));
     }
-    return days.map(d => ({ d, items: (map[d] || []).slice().sort((a,b) => a.startISO.localeCompare(b.startISO)) }));
-  }, [reservations, plan.startISO, (plan as any).endISO]);
+    return days;
+  }, [plan.startISO, (plan as any).endISO]);
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.45)", display:"grid", placeItems:"center", zIndex:650 }} onClick={onClose}>
@@ -1269,11 +1594,36 @@ function TripDetailsOverlay({
 
         <div style={{ marginTop:12, fontSize:12, color:"#475569" }}>{plan.startISO} {(plan as any).endISO ? `→ ${(plan as any).endISO}` : ""}</div>
 
-        <ul style={{ listStyle:"none", margin:0, padding:0, display:"grid", gap:12, marginTop:12 }}>
-          {byDay.map(({ d, items }) => (
-            <li key={d} style={{ border:"1px solid #e5e7eb", borderRadius:12, padding:12, background:"#fff" }}>
-              <div style={{ fontWeight:800, marginBottom:6 }}>{d}</div>
-              <DayTimeline dateISO={d} reservations={items} />
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            display: "grid",
+            gap: 12,
+            marginTop: 12,
+          }}
+        >
+          {dayList.map((d) => (
+            <li
+              key={d}
+              style={{
+                border: "1px solid #e5e7eb",
+                borderRadius: 16,
+                background: "#f8fafc",
+                padding: 0,
+              }}
+            >
+              <DayPlanner
+                dateISO={d}
+                activities={activitiesByDay[d] || []}
+                reservations={reservations}
+                onAdd={(payload) => onAddActivity(d, payload)}
+                onUpdate={(activityId, updates) =>
+                  onUpdateActivity(d, activityId, updates)
+                }
+                onRemove={(activityId) => onRemoveActivity(d, activityId)}
+              />
             </li>
           ))}
         </ul>
@@ -1282,50 +1632,663 @@ function TripDetailsOverlay({
   );
 }
 
-function DayTimeline({ dateISO, reservations }: { dateISO: string; reservations: Reservation[] }): JSX.Element {
-  const [events, setEvents] = useState<{ id: string; start: string; end?: string; title: string; type?: string }[]>([]);
-  const blocks = useMemo(() => {
-    const toBlocks = (arr: { start: string; end?: string; title: string }[], color: string) => {
-      return arr.map((a, i) => {
-        const sh = Number(a.start.slice(11,13) || "0"), sm = Number(a.start.slice(14,16) || "0");
-        const eh = Number((a.end||a.start).slice(11,13) || "0"), em = Number((a.end||a.start).slice(14,16) || "0");
-        const startMin = sh*60+sm, endMin = Math.max(eh*60+em, startMin+30);
-        return { top: (startMin/60)*44, height: ((endMin-startMin)/60)*44, title: a.title, key: a.title+"-"+i, color };
-      });
-    };
-    const res = toBlocks(reservations.map(r => ({ start: r.startISO, end: r.endISO, title: (r.type.toUpperCase()) + (r.title?": "+r.title:"") })), "#e0f2fe");
-    const user = toBlocks(events.map(e => ({ start: e.start, end: e.end, title: (e.type?`[${e.type}] `:"")+e.title })), "#dcfce7");
-    return [...res, ...user];
-  }, [reservations, events]);
+type DayPlannerProps = {
+  dateISO: string;
+  activities: TripActivity[];
+  reservations: Reservation[];
+  onAdd: (input: {
+    title: string;
+    start: string;
+    end: string;
+    category?: string;
+    notes?: string;
+  }) => void;
+  onUpdate: (
+    activityId: string,
+    updates: {
+      title?: string;
+      start?: string;
+      end?: string;
+      category?: string;
+      notes?: string;
+    }
+  ) => void;
+  onRemove: (activityId: string) => void;
+};
 
-  function addEvent() {
-    const title = prompt("Item (e.g., Dinner at …)");
-    if (!title) return;
-    const type = prompt("Type (Meal / Flight / Sightseeing) optional") || undefined;
-    const s = prompt("Start (HH:MM 24h)") || "12:00";
-    const e = prompt("End (HH:MM 24h, optional)") || undefined;
-    const mk = (hhmm: string) => dateISO + "T" + (hhmm.length===5?hhmm:hhmm.padStart(5,"0")) + ":00";
-    setEvents(prev => [...prev, { id: String(Date.now())+Math.random(), title, type, start: mk(s), end: e ? mk(e) : undefined }]);
+const CATEGORY_OPTIONS = [
+  { value: "experience", label: "Experience", icon: "🗺️" },
+  { value: "meal", label: "Meal", icon: "🍽️" },
+  { value: "travel", label: "Travel", icon: "🚆" },
+  { value: "free", label: "Downtime", icon: "🧘" },
+];
+
+function categoryStyle(category?: string) {
+  const key = category?.toLowerCase();
+  switch (key) {
+    case "meal":
+      return {
+        bg: "#fef3c7",
+        border: "#fcd34d",
+        text: "#92400e",
+        badgeBg: "rgba(217, 119, 6, 0.12)",
+        badgeText: "#92400e",
+        label: "Meal",
+        icon: "🍽️",
+      };
+    case "travel":
+      return {
+        bg: "#fee2e2",
+        border: "#fca5a5",
+        text: "#991b1b",
+        badgeBg: "rgba(185, 28, 28, 0.12)",
+        badgeText: "#991b1b",
+        label: "Travel",
+        icon: "🚆",
+      };
+    case "other":
+      return {
+        bg: "#f1f5f9",
+        border: "#cbd5e1",
+        text: "#0f172a",
+        badgeBg: "rgba(15, 23, 42, 0.08)",
+        badgeText: "#0f172a",
+        label: "Custom",
+        icon: "✨",
+      };
+    case "free":
+      return {
+        bg: "#e2e8f0",
+        border: "#cbd5e1",
+        text: "#1e293b",
+        badgeBg: "rgba(30, 41, 59, 0.08)",
+        badgeText: "#475569",
+        label: "Downtime",
+        icon: "🧘",
+      };
+    case "experience":
+    default:
+      return {
+        bg: "#dcfce7",
+        border: "#86efac",
+        text: "#166534",
+        badgeBg: "rgba(22, 101, 52, 0.12)",
+        badgeText: "#166534",
+        label: "Experience",
+        icon: "🗺️",
+      };
   }
+}
+
+function formatReservationType(type: ReservationType) {
+  switch (type) {
+    case "flight":
+      return "Flight";
+    case "hotel":
+      return "Hotel";
+    case "train":
+      return "Train";
+    case "event":
+    default:
+      return "Event";
+  }
+}
+
+function DayPlanner({
+  dateISO,
+  activities,
+  reservations,
+  onAdd,
+  onUpdate,
+  onRemove,
+}: DayPlannerProps): JSX.Element {
+  const dayDate = useMemo(() => new Date(`${dateISO}T00:00:00`), [dateISO]);
+  const headerLabel = dayDate.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+
+  const sortedActivities = useMemo(
+    () => activities.slice().sort((a, b) => a.startISO.localeCompare(b.startISO)),
+    [activities]
+  );
+
+  const dayReservations = useMemo(
+    () =>
+      reservations.filter(
+        (res) => clipRangeToDay(dateISO, res.startISO, res.endISO) !== null
+      ),
+    [reservations, dateISO]
+  );
+
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState({
+    title: "",
+    start: "09:00",
+    end: "11:00",
+    category: "experience",
+    notes: "",
+  });
+
+  const resetDraft = () => {
+    setDraft({ title: "", start: "09:00", end: "11:00", category: "experience", notes: "" });
+    setEditingId(null);
+  };
+
+  const beginEdit = (activity: TripActivity) => {
+    setShowForm(true);
+    setEditingId(activity.id);
+    setDraft({
+      title: activity.title,
+      start: activity.startISO.slice(11, 16),
+      end: activity.endISO.slice(11, 16),
+      category: activity.category || "experience",
+      notes: activity.notes || "",
+    });
+  };
+
+  const cancelForm = () => {
+    resetDraft();
+    setShowForm(false);
+  };
+
+  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const title = draft.title.trim();
+    if (!title) return;
+    const start = normalizeHHMM(draft.start);
+    const endNormalized = normalizeHHMM(draft.end, start);
+    const ensured = ensureEndAfterStart(start, endNormalized);
+    const payload = {
+      title,
+      start,
+      end: ensured.end,
+      category: draft.category,
+      notes: draft.notes.trim() || undefined,
+    };
+    if (editingId) {
+      onUpdate(editingId, payload);
+    } else {
+      onAdd(payload);
+    }
+    resetDraft();
+    setShowForm(false);
+  };
+
+  const pxPerHour = 36;
+  const pxPerMinute = pxPerHour / 60;
+  const timelineHeight = pxPerHour * 24;
+
+  const timelineBlocks = useMemo(() => {
+    const blocks: {
+      id: string;
+      top: number;
+      height: number;
+      title: string;
+      subtitle?: string;
+      bg: string;
+      border: string;
+      text: string;
+      badge?: string;
+      badgeBg?: string;
+      badgeText?: string;
+      icon?: string;
+    }[] = [];
+
+    const formatRange = (startISO: string, endISO?: string) => {
+      const start = startISO.slice(11, 16);
+      const end = (endISO || startISO).slice(11, 16);
+      return `${start} – ${end}`;
+    };
+
+    dayReservations.forEach((res) => {
+      const clipped = clipRangeToDay(dateISO, res.startISO, res.endISO);
+      if (!clipped) return;
+      const { startMin, endMin } = clipped;
+      const title = res.title || formatReservationType(res.type);
+      const subtitleParts = [
+        formatRange(res.startISO, res.endISO),
+        formatReservationType(res.type),
+      ];
+      if (res.location?.city) subtitleParts.push(res.location.city);
+      const subtitle = subtitleParts.join(" · ");
+      blocks.push({
+        id: `res-${res.id}`,
+        top: startMin * pxPerMinute,
+        height: Math.max(34, (endMin - startMin) * pxPerMinute),
+        title,
+        subtitle,
+        bg: "#dbeafe",
+        border: "#93c5fd",
+        text: "#1d4ed8",
+        badge: "Reservation",
+        badgeBg: "rgba(59,130,246,0.14)",
+        badgeText: "#1d4ed8",
+        icon: "📌",
+      });
+    });
+
+    sortedActivities.forEach((activity) => {
+      const clipped = clipRangeToDay(
+        dateISO,
+        activity.startISO,
+        activity.endISO
+      );
+      if (!clipped) return;
+      const { startMin, endMin } = clipped;
+      const style = categoryStyle(activity.category);
+      const subtitleParts = [
+        `${activity.startISO.slice(11, 16)} – ${activity.endISO.slice(11, 16)}`,
+      ];
+      if (activity.notes) subtitleParts.push(activity.notes);
+      blocks.push({
+        id: `act-${activity.id}`,
+        top: startMin * pxPerMinute,
+        height: Math.max(40, (endMin - startMin) * pxPerMinute),
+        title: activity.title,
+        subtitle: subtitleParts.join(" · "),
+        bg: style.bg,
+        border: style.border,
+        text: style.text,
+        badge: style.label,
+        badgeBg: style.badgeBg,
+        badgeText: style.badgeText,
+        icon: style.icon,
+      });
+    });
+
+    return blocks.sort((a, b) => a.top - b.top);
+  }, [sortedActivities, dayReservations, dateISO, pxPerMinute]);
+
+  const disableSubmit = !draft.title.trim();
 
   return (
-    <div>
-      <div style={{ display:"grid", gridTemplateColumns:"62px 1fr", gap:10 }}>
-        <div style={{ display:"grid", gridTemplateRows:"repeat(24, 44px)" }}>
-          {Array.from({ length: 24 }).map((_, h) => (
-            <div key={h} style={{ fontSize: 12, color: "#64748b" }}>{String(h).padStart(2,"0")}:00</div>
+    <div style={{ padding: 16, display: "grid", gap: 16 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: "#0f172a" }}>{headerLabel}</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <span
+            style={{
+              background: "#e0f2fe",
+              color: "#0369a1",
+              padding: "4px 10px",
+              borderRadius: 999,
+              fontSize: 12,
+              fontWeight: 600,
+            }}
+          >
+            {dayReservations.length} reservation{dayReservations.length === 1 ? "" : "s"}
+          </span>
+          <span
+            style={{
+              background: "#dcfce7",
+              color: "#15803d",
+              padding: "4px 10px",
+              borderRadius: 999,
+              fontSize: 12,
+              fontWeight: 600,
+            }}
+          >
+            {sortedActivities.length} planned item{sortedActivities.length === 1 ? "" : "s"}
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 12 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateRows: `repeat(24, ${pxPerHour}px)`,
+            justifyItems: "flex-end",
+            fontSize: 11,
+            color: "#94a3b8",
+            paddingTop: 2,
+            rowGap: 0,
+          }}
+        >
+          {Array.from({ length: 24 }).map((_, hour) => (
+            <div key={hour}>{String(hour).padStart(2, "0")}:00</div>
           ))}
         </div>
-        <div style={{ position: "relative", border: "1px solid #e5e7eb", borderRadius: 12, height: 24 * 44, background: "#f8fafc" }}>
-          {blocks.map(b => (
-            <div key={b.key} style={{ position: "absolute", left: 8, right: 8, top: b.top, height: b.height, background: b.color, borderRadius: 8, padding: "6px 8px", fontSize: 12, border: "1px solid #e2e8f0", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
-              {b.title}
+        <div
+          style={{
+            position: "relative",
+            border: "1px solid #e2e8f0",
+            borderRadius: 16,
+            height: timelineHeight,
+            background: "#f8fafc",
+            overflow: "hidden",
+          }}
+        >
+          {Array.from({ length: 25 }).map((_, idx) => (
+            <div
+              key={`hour-${idx}`}
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                top: idx * pxPerHour,
+                borderTop: idx === 0 ? "none" : "1px solid rgba(148,163,184,0.28)",
+              }}
+            />
+          ))}
+          {Array.from({ length: 24 }).map((_, idx) => (
+            <div
+              key={`half-${idx}`}
+              style={{
+                position: "absolute",
+                left: 8,
+                right: 8,
+                top: idx * pxPerHour + pxPerHour / 2,
+                borderTop: "1px dashed rgba(148,163,184,0.2)",
+              }}
+            />
+          ))}
+          {timelineBlocks.map((block) => (
+            <div
+              key={block.id}
+              style={{
+                position: "absolute",
+                left: 10,
+                right: 10,
+                top: block.top,
+                height: block.height,
+                background: block.bg,
+                border: `1px solid ${block.border}`,
+                color: block.text,
+                borderRadius: 14,
+                padding: "10px 12px",
+                boxShadow: "0 14px 30px rgba(15, 23, 42, 0.08)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  fontWeight: 700,
+                  fontSize: 13,
+                }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  {block.icon && <span>{block.icon}</span>}
+                  {block.title}
+                </span>
+                {block.badge && (
+                  <span
+                    style={{
+                      background: block.badgeBg || "rgba(15,23,42,0.06)",
+                      color: block.badgeText || "#0f172a",
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      fontSize: 10,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {block.badge}
+                  </span>
+                )}
+              </div>
+              {block.subtitle && (
+                <div style={{ fontSize: 11, color: "rgba(15,23,42,0.7)" }}>
+                  {block.subtitle}
+                </div>
+              )}
             </div>
           ))}
         </div>
       </div>
-      <div style={{ display:"flex", justifyContent:"flex-end", marginTop:8 }}>
-        <button onClick={addEvent} style={{ border:"1px solid #e5e7eb", borderRadius:8, padding:"6px 10px" }}>Add item</button>
+
+      <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>Planned items</div>
+        {sortedActivities.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#64748b" }}>
+            No custom plans yet. Add ideas below to build your perfect day.
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {sortedActivities.map((activity) => {
+              const style = categoryStyle(activity.category);
+              return (
+                <div
+                  key={activity.id}
+                  style={{
+                    border: `1px solid ${style.border}`,
+                    background: "#fff",
+                    borderRadius: 14,
+                    padding: "12px 14px",
+                    display: "grid",
+                    gap: 6,
+                    boxShadow: "0 10px 30px rgba(15,23,42,0.05)",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ fontWeight: 700, color: "#0f172a", display: "flex", gap: 8, alignItems: "center" }}>
+                      <span>{style.icon}</span>
+                      <span>{activity.title}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        onClick={() => beginEdit(activity)}
+                        style={{
+                          border: "1px solid #cbd5e1",
+                          background: "#f8fafc",
+                          borderRadius: 999,
+                          padding: "4px 10px",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => onRemove(activity.id)}
+                        style={{
+                          border: "1px solid #fecaca",
+                          background: "#fee2e2",
+                          color: "#b91c1c",
+                          borderRadius: 999,
+                          padding: "4px 10px",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#1e293b" }}>
+                    {activity.startISO.slice(11, 16)} – {activity.endISO.slice(11, 16)}
+                    {style.label ? ` · ${style.label}` : ""}
+                  </div>
+                  {activity.notes && (
+                    <div style={{ fontSize: 12, color: "#475569" }}>{activity.notes}</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>Reservations</div>
+        {dayReservations.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#64748b" }}>
+            No reservations block this day yet.
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 10 }}>
+            {dayReservations.map((res) => (
+              <div
+                key={res.id}
+                style={{
+                  border: "1px solid #bfdbfe",
+                  background: "#eff6ff",
+                  borderRadius: 12,
+                  padding: "10px 12px",
+                  display: "grid",
+                  gap: 4,
+                  fontSize: 12,
+                }}
+              >
+                <div style={{ fontWeight: 700, color: "#1d4ed8" }}>
+                  {res.title || formatReservationType(res.type)}
+                </div>
+                <div style={{ color: "#1e3a8a" }}>
+                  {res.startISO.slice(11, 16)} – {(res.endISO || res.startISO).slice(11, 16)}
+                  {res.location?.city ? ` · ${res.location.city}` : ""}
+                </div>
+                {res.notes && (
+                  <div style={{ color: "#334155" }}>{res.notes}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div
+        style={{
+          border: "1px dashed #cbd5e1",
+          borderRadius: 16,
+          padding: "16px",
+          background: showForm ? "#ffffff" : "#f8fafc",
+          display: "grid",
+          gap: 12,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: "#0f172a" }}>
+            {editingId ? "Update plan item" : "Add to this day"}
+          </div>
+          {!showForm && (
+            <button
+              onClick={() => setShowForm(true)}
+              style={{
+                border: "1px solid #38bdf8",
+                background: "linear-gradient(135deg,#06b6d4,#0ea5a8)",
+                color: "#fff",
+                borderRadius: 999,
+                padding: "6px 14px",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+            >
+              Plan something
+            </button>
+          )}
+        </div>
+        {showForm && (
+          <form onSubmit={handleSubmit} style={{ display: "grid", gap: 10 }}>
+            <div style={{ display: "grid", gap: 6 }}>
+              <label style={{ fontSize: 12, color: "#475569", fontWeight: 600 }}>Title</label>
+              <input
+                value={draft.title}
+                onChange={(e) => setDraft((prev) => ({ ...prev, title: e.target.value }))}
+                placeholder="e.g. TeamLab Planets"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #cbd5e1",
+                  fontSize: 13,
+                }}
+              />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 12 }}>
+              <div style={{ display: "grid", gap: 6 }}>
+                <label style={{ fontSize: 12, color: "#475569", fontWeight: 600 }}>Start</label>
+                <input
+                  value={draft.start}
+                  onChange={(e) => setDraft((prev) => ({ ...prev, start: e.target.value }))}
+                  type="time"
+                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #cbd5e1" }}
+                />
+              </div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <label style={{ fontSize: 12, color: "#475569", fontWeight: 600 }}>End</label>
+                <input
+                  value={draft.end}
+                  onChange={(e) => setDraft((prev) => ({ ...prev, end: e.target.value }))}
+                  type="time"
+                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #cbd5e1" }}
+                />
+              </div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <label style={{ fontSize: 12, color: "#475569", fontWeight: 600 }}>Category</label>
+                <select
+                  value={draft.category}
+                  onChange={(e) => setDraft((prev) => ({ ...prev, category: e.target.value }))}
+                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #cbd5e1", fontSize: 13 }}
+                >
+                  {CATEGORY_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.icon} {opt.label}
+                    </option>
+                  ))}
+                  <option value="other">✨ Something else</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ display: "grid", gap: 6 }}>
+              <label style={{ fontSize: 12, color: "#475569", fontWeight: 600 }}>Notes</label>
+              <textarea
+                value={draft.notes}
+                onChange={(e) => setDraft((prev) => ({ ...prev, notes: e.target.value }))}
+                rows={3}
+                placeholder="Add details, confirmation numbers, meeting points…"
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #cbd5e1",
+                  fontSize: 13,
+                  resize: "vertical",
+                }}
+              />
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                onClick={cancelForm}
+                style={{
+                  border: "1px solid #cbd5e1",
+                  background: "#f8fafc",
+                  borderRadius: 999,
+                  padding: "6px 14px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={disableSubmit}
+                style={{
+                  border: "none",
+                  background: disableSubmit
+                    ? "#cbd5e1"
+                    : "linear-gradient(135deg,#06b6d4,#0ea5a8)",
+                  color: disableSubmit ? "#fff" : "#fff",
+                  borderRadius: 999,
+                  padding: "6px 18px",
+                  fontSize: 12,
+                  fontWeight: 700,
+                  cursor: disableSubmit ? "not-allowed" : "pointer",
+                  opacity: disableSubmit ? 0.7 : 1,
+                }}
+              >
+                {editingId ? "Save changes" : "Add to plan"}
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );
